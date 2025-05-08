@@ -26,6 +26,7 @@
 #include <QDir>
 #include <QDialog>
 #include <ui_Downloader.h>
+#include <QSaveFile>
 
 namespace Ui
 {
@@ -69,7 +70,7 @@ private slots:
    void openDownload();
    void installUpdate();
    void cancelDownload();
-   void saveFile(qint64 received, qint64 total);
+   void processReceivedData();
    void calculateSizes(qint64 received, qint64 total);
    void updateProgress(qint64 received, qint64 total);
    void calculateTimeRemaining(qint64 received, qint64 total);
@@ -79,6 +80,7 @@ private:
    qreal round(const qreal &input);
 
 private:
+   QSaveFile* m_saveFile = nullptr; // or QTemporaryFile
    QString m_url;
    uint m_startTime;
    QDir m_downloadDir;

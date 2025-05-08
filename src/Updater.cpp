@@ -26,6 +26,8 @@
 #include <QApplication>
 #include <QJsonDocument>
 #include <QDesktopServices>
+#include <QPushButton>
+#include <stdlib.h>
 
 #include "Updater.h"
 #include "Downloader.h"
@@ -458,34 +460,58 @@ void Updater::setUpdateAvailable(const bool available)
 
       box.setText(title);
       box.setInformativeText(text);
-      box.setStandardButtons(QMessageBox::No | QMessageBox::Yes);
-      box.setDefaultButton(QMessageBox::Yes);
-
-      if (box.exec() == QMessageBox::Yes)
-      {
-         if (!openUrl().isEmpty())
-            QDesktopServices::openUrl(QUrl(openUrl()));
-
-         else if (downloaderEnabled())
-         {
-            m_downloader->setUrlId(url());
-            m_downloader->setFileName(downloadUrl().split("/").last());
-            m_downloader->setMandatoryUpdate(m_mandatoryUpdate);
-            auto url = QUrl(downloadUrl());
-            url.setUserName(m_downloadUserName);
-            url.setPassword(m_downloadPassword);
-            m_downloader->startDownload(url);
-         }
-
-         else
-            QDesktopServices::openUrl(QUrl(downloadUrl()));
-      }
-      else
-      {
-         if (m_mandatoryUpdate)
-         {
-            QApplication::quit();
-         }
+      
+      // Use different button setup for mandatory updates
+      if (m_mandatoryUpdate) {
+          // For mandatory updates, use "Update" and "Quit" buttons
+          QPushButton *updateButton = box.addButton(tr("Update"), QMessageBox::AcceptRole);
+          QPushButton *quitButton = box.addButton(tr("Quit"), QMessageBox::RejectRole);
+          box.setDefaultButton(updateButton);
+          
+          box.exec();
+          
+          if (box.clickedButton() == updateButton) {
+              // User chose to update
+              if (!openUrl().isEmpty())
+                 QDesktopServices::openUrl(QUrl(openUrl()));
+              else if (downloaderEnabled())
+              {
+                 m_downloader->setUrlId(url());
+                 m_downloader->setFileName(downloadUrl().split("/").last());
+                 m_downloader->setMandatoryUpdate(m_mandatoryUpdate);
+                 auto url = QUrl(downloadUrl());
+                 url.setUserName(m_downloadUserName);
+                 url.setPassword(m_downloadPassword);
+                 m_downloader->startDownload(url);
+              }
+              else
+                 QDesktopServices::openUrl(QUrl(downloadUrl()));
+          } else {
+              // User chose to quit - use exit(0) instead of QApplication::quit() for more reliable termination
+              exit(0);
+          }
+      } else {
+          // For non-mandatory updates, use standard Yes/No buttons
+          box.setStandardButtons(QMessageBox::No | QMessageBox::Yes);
+          box.setDefaultButton(QMessageBox::Yes);
+          
+          if (box.exec() == QMessageBox::Yes)
+          {
+             if (!openUrl().isEmpty())
+                QDesktopServices::openUrl(QUrl(openUrl()));
+             else if (downloaderEnabled())
+             {
+                m_downloader->setUrlId(url());
+                m_downloader->setFileName(downloadUrl().split("/").last());
+                m_downloader->setMandatoryUpdate(m_mandatoryUpdate);
+                auto url = QUrl(downloadUrl());
+                url.setUserName(m_downloadUserName);
+                url.setPassword(m_downloadPassword);
+                m_downloader->startDownload(url);
+             }
+             else
+                QDesktopServices::openUrl(QUrl(downloadUrl()));
+          }
       }
    }
 

@@ -31,6 +31,7 @@
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 #include <QAuthenticator>
+#include <QDebug>
 
 #include <math.h>
 
@@ -106,53 +107,61 @@ void Downloader::setUrlId(const QString &url)
 /**
  * Begins downloading the file at the given \a url
  */
-void Downloader::startDownload(const QUrl &url)
-{
-   /* Reset UI */
-   m_ui->progressBar->setValue(0);
-   m_ui->stopButton->setText(tr("Stop"));
-   m_ui->downloadLabel->setText(tr("Downloading updates"));
-   m_ui->timeLabel->setText(tr("Time remaining") + ": " + tr("unknown"));
-
-   /* Configure the network request */
-   QNetworkRequest request(url);
-
-   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
-   
-#if (QT_VERSION >= QT_VERSION_CHECK(5, 15, 0))
-   /* 10s timeout */
-   request.setTransferTimeout(10000);
-#endif
-
-   if (!m_userAgentString.isEmpty())
-      request.setRawHeader("User-Agent", m_userAgentString.toUtf8());
-
-   /* Start download */
-   m_reply = m_manager->get(request);
-   m_startTime = QDateTime::currentDateTime().toSecsSinceEpoch();
-
-   /* Ensure that downloads directory exists */
-   if (!m_downloadDir.exists())
-      m_downloadDir.mkpath(".");
-
-   /* Remove old downloads */
-   QFile::remove(m_downloadDir.filePath(m_fileName));
-   QFile::remove(m_downloadDir.filePath(m_fileName + PARTIAL_DOWN));
-
-   /* Update UI when download progress changes or download finishes */
-   connect(m_reply, SIGNAL(metaDataChanged()), this, SLOT(metaDataChanged()));
-   connect(m_reply, SIGNAL(downloadProgress(qint64, qint64)), this, SLOT(updateProgress(qint64, qint64)));
-   connect(m_reply, SIGNAL(finished()), this, SLOT(finished()));
-
-   showNormal();
-}
+ void Downloader::startDownload(const QUrl &url)
+ {
+     /* Reset UI */
+     m_ui->progressBar->setValue(0);
+     m_ui->stopButton->setText(tr("Stop"));
+     m_ui->downloadLabel->setText(tr("Downloading updates"));
+     m_ui->timeLabel->setText(tr("Time remaining") + ": " + tr("unknown"));
+ 
+     /* Close any existing file */
+     if (m_saveFile) {
+         m_saveFile->cancelWriting(); // Discard any partial content
+         delete m_saveFile;
+         m_saveFile = nullptr;
+     }
+ 
+     /* Configure the network request */
+     QNetworkRequest request(url);
+     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+     
+ #if (QT_VERSION >= QT_VERSION_CHECK(5, 15, 0))
+     /* 10s timeout */
+     request.setTransferTimeout(10000);
+ #endif
+ 
+     if (!m_userAgentString.isEmpty())
+         request.setRawHeader("User-Agent", m_userAgentString.toUtf8());
+ 
+     /* Start download */
+     m_reply = m_manager->get(request);
+     m_startTime = QDateTime::currentDateTime().toSecsSinceEpoch();
+ 
+     /* Ensure that downloads directory exists */
+     if (!m_downloadDir.exists())
+         m_downloadDir.mkpath(".");
+ 
+     /* Update UI when download progress changes or download finishes */
+     connect(m_reply, SIGNAL(metaDataChanged()), this, SLOT(metaDataChanged()));
+     connect(m_reply, SIGNAL(downloadProgress(qint64, qint64)), this, SLOT(updateProgress(qint64, qint64)));
+     connect(m_reply, SIGNAL(readyRead()), this, SLOT(processReceivedData()));
+     connect(m_reply, SIGNAL(finished()), this, SLOT(finished()));
+ 
+     showNormal();
+ }
 
 /**
  * Changes the name of the downloaded file
  */
 void Downloader::setFileName(const QString &file)
 {
-   m_fileName = file;
+   // Sanitize the filename by removing quotes and semicolons
+   QString sanitizedFile = file;
+   sanitizedFile.remove('"');
+   sanitizedFile.remove(';');
+   
+   m_fileName = sanitizedFile;
 
    if (m_fileName.isEmpty())
       m_fileName = "QSU_Update.bin";
@@ -168,22 +177,57 @@ void Downloader::setUserAgentString(const QString &agent)
 
 void Downloader::finished()
 {
-   if (m_reply->error() != QNetworkReply::NoError)
-   {
-      QFile::remove(m_downloadDir.filePath(m_fileName + PARTIAL_DOWN));
-      return;
-   }
+    /* Handle download errors */
+    if (m_reply->error() != QNetworkReply::NoError) {
+        if (m_saveFile) {
+            m_saveFile->cancelWriting(); // Discard any partial content
+            delete m_saveFile;
+            m_saveFile = nullptr;
+        }
+        
+        qWarning() << "Download error:" << m_reply->errorString();
+        // Additional error handling and user notification
+        return;
+    }
 
-   /* Rename file */
-   QFile::rename(m_downloadDir.filePath(m_fileName + PARTIAL_DOWN), m_downloadDir.filePath(m_fileName));
+    /* Process any remaining data */
+    if (m_reply->bytesAvailable() > 0) {
+        if (m_saveFile && m_saveFile->isOpen()) {
+            m_saveFile->write(m_reply->read(m_reply->bytesAvailable()));
+        }
+    }
 
-   /* Notify application */
-   emit downloadFinished(m_url, m_downloadDir.filePath(m_fileName));
+    /* Finalize the file */
+    bool fileSuccess = false;
+    if (m_saveFile) {
+        fileSuccess = m_saveFile->commit(); // This renames the temp file to the target file
+        delete m_saveFile;
+        m_saveFile = nullptr;
+    }
 
-   /* Install the update */
-   m_reply->close();
-   installUpdate();
-   setVisible(false);
+    /* Notify application on success */
+    if (fileSuccess) {
+        emit downloadFinished(m_url, m_downloadDir.filePath(m_fileName));
+    } else {
+        qWarning() << "Failed to save downloaded file";
+        // Handle file save error
+    }
+
+    /* Close the reply */
+    m_reply->close();
+    
+    /* Update UI */
+    m_ui->openButton->setEnabled(fileSuccess);
+    m_ui->openButton->setVisible(fileSuccess);
+    m_ui->timeLabel->setText(tr("The installer will open separately") + "...");
+
+    /* Install the update directly without calling installUpdate() */
+    if (fileSuccess && !useCustomInstallProcedures()) {
+        qDebug() << "Opening update file from finished():" << m_downloadDir.filePath(m_fileName);
+        openDownload();
+    }
+    
+    setVisible(false);
 }
 
 /**
@@ -193,12 +237,22 @@ void Downloader::finished()
  */
 void Downloader::openDownload()
 {
-   if (!m_fileName.isEmpty())
-      QDesktopServices::openUrl(QUrl::fromLocalFile(m_downloadDir.filePath(m_fileName)));
-
-   else
-   {
-      QMessageBox::critical(this, tr("Error"), tr("Cannot find downloaded update!"), QMessageBox::Close);
+   if (!m_fileName.isEmpty()) {
+      QString filePath = m_downloadDir.filePath(m_fileName);
+      QFileInfo fileInfo(filePath);
+      
+      // Check if the file exists before trying to open it
+      if (fileInfo.exists()) {
+         qDebug() << "Opening update file:" << filePath;
+         QDesktopServices::openUrl(QUrl::fromLocalFile(filePath));
+      } else {
+         qDebug() << "Update file not found at:" << filePath;
+         QMessageBox::critical(this, tr("Error"), 
+                              tr("Cannot find downloaded update at %1").arg(filePath), 
+                              QMessageBox::Close);
+      }
+   } else {
+      QMessageBox::critical(this, tr("Error"), tr("Cannot find downloaded update: filename is empty"), QMessageBox::Close);
    }
 }
 
@@ -209,50 +263,15 @@ void Downloader::openDownload()
  *       not instruct the OS to open the downloaded file. You can use the
  *       signals fired by the \c QSimpleUpdater to install the update with your
  *       own implementations/code.
+ * 
+ * \note This method is now only used when the user clicks the "Open" button manually.
+ *       The automatic installation after download is handled directly in the finished() method.
  */
 void Downloader::installUpdate()
 {
-   if (useCustomInstallProcedures())
-      return;
-
-   /* Update labels */
-   m_ui->stopButton->setText(tr("Close"));
-   m_ui->downloadLabel->setText(tr("Download complete!"));
+   m_ui->openButton->setEnabled(false);
+   m_ui->openButton->setVisible(false);
    m_ui->timeLabel->setText(tr("The installer will open separately") + "...");
-
-   /* Ask the user to install the download */
-   QMessageBox box;
-   box.setIcon(QMessageBox::Question);
-   box.setDefaultButton(QMessageBox::Ok);
-   box.setStandardButtons(QMessageBox::Ok | QMessageBox::Cancel);
-   box.setInformativeText(tr("Click \"OK\" to begin installing the update"));
-
-   QString text = tr("In order to install the update, you may need to "
-                     "quit the application.");
-
-   if (m_mandatoryUpdate)
-      text = tr("In order to install the update, you may need to "
-                "quit the application. This is a mandatory update, exiting now will close the application.");
-
-   box.setText("<h3>" + text + "</h3>");
-
-   /* User wants to install the download */
-   if (box.exec() == QMessageBox::Ok)
-   {
-      if (!useCustomInstallProcedures())
-         openDownload();
-   }
-   /* Wait */
-   else
-   {
-      if (m_mandatoryUpdate)
-         QApplication::quit();
-
-      m_ui->openButton->setEnabled(true);
-      m_ui->openButton->setVisible(true);
-      m_ui->timeLabel->setText(tr("Click the \"Open\" button to "
-                                  "apply the update"));
-   }
 }
 
 /**
@@ -266,8 +285,7 @@ void Downloader::cancelDownload()
       QMessageBox box;
       box.setWindowTitle(tr("Updater"));
       box.setIcon(QMessageBox::Question);
-      box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
-
+      
       QString text = tr("Are you sure you want to cancel the download?");
       if (m_mandatoryUpdate)
       {
@@ -276,47 +294,77 @@ void Downloader::cancelDownload()
       }
       box.setText(text);
 
-      if (box.exec() == QMessageBox::Yes)
-      {
-         hide();
-         m_reply->abort();
-         if (m_mandatoryUpdate)
-            QApplication::quit();
+      // Use different button setup for mandatory updates
+      if (m_mandatoryUpdate) {
+          // For mandatory updates, use "Continue" and "Quit" buttons
+          QPushButton *continueButton = box.addButton(tr("Continue"), QMessageBox::RejectRole);
+          QPushButton *quitButton = box.addButton(tr("Quit"), QMessageBox::AcceptRole);
+          box.setDefaultButton(continueButton);
+          
+          box.exec();
+          
+          if (box.clickedButton() == quitButton) {
+              hide();
+              m_reply->abort();
+              // Use exit(0) instead of QApplication::quit() for more reliable termination
+              exit(0);
+          }
+      } else {
+          // For non-mandatory updates, use standard Yes/No buttons
+          box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+          
+          if (box.exec() == QMessageBox::Yes)
+          {
+             hide();
+             m_reply->abort();
+          }
       }
    }
    else
    {
-      if (m_mandatoryUpdate)
-         QApplication::quit();
-
-      hide();
+      if (m_mandatoryUpdate) {
+         // Use exit(0) instead of QApplication::quit() for more reliable termination
+         hide();
+         exit(0);
+      } else {
+         hide();
+      }
    }
 }
 
 /**
  * Writes the downloaded data to the disk
  */
-void Downloader::saveFile(qint64 received, qint64 total)
-{
-   Q_UNUSED(received);
-   Q_UNUSED(total);
-
-   /* Check if we need to redirect */
-   QUrl url = m_reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl();
-   if (!url.isEmpty())
-   {
-      startDownload(url);
-      return;
-   }
-
-   /* Save downloaded data to disk */
-   QFile file(m_downloadDir.filePath(m_fileName + PARTIAL_DOWN));
-   if (file.open(QIODevice::WriteOnly | QIODevice::Append))
-   {
-      file.write(m_reply->readAll());
-      file.close();
-   }
-}
+ void Downloader::processReceivedData()
+ {
+     /* Check if we need to redirect */
+     QUrl url = m_reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl();
+     if (!url.isEmpty()) {
+         startDownload(url);
+         return;
+     }
+ 
+     /* Make sure we have a valid filename */
+     if (m_fileName.isEmpty()) {
+         return; // Wait until we have a filename before writing data
+     }
+ 
+     /* Initialize the save file if needed */
+     if (!m_saveFile) {
+         m_saveFile = new QSaveFile(m_downloadDir.filePath(m_fileName));
+         if (!m_saveFile->open(QIODevice::WriteOnly)) {
+             qWarning() << "Failed to open file for writing:" << m_saveFile->errorString();
+             delete m_saveFile;
+             m_saveFile = nullptr;
+             return;
+         }
+     }
+ 
+     /* Write data to file */
+     if (m_saveFile && m_saveFile->isOpen()) {
+         m_saveFile->write(m_reply->read(m_reply->bytesAvailable()));
+     }
+ }
 
 /**
  * Calculates the appropiate size units (bytes, KB or MB) for the received
@@ -355,18 +403,52 @@ void Downloader::calculateSizes(qint64 received, qint64 total)
  */
 void Downloader::metaDataChanged()
 {
-   QString filename = "";
-   QVariant variant = m_reply->header(QNetworkRequest::ContentDispositionHeader);
-   if (variant.isValid())
-   {
-      QString contentDisposition = QByteArray::fromPercentEncoding(variant.toByteArray()).constData();
-      QRegularExpression regExp(R"(filename=(\S+))");
-      QRegularExpressionMatch match = regExp.match(contentDisposition);
-      if (match.hasMatch())
-      {
-         filename = match.captured(1);
+   // Get the Content-Disposition header
+   QVariant contentDispositionVariant = m_reply->header(QNetworkRequest::ContentDispositionHeader);
+   
+   if (contentDispositionVariant.isValid()) {
+      // Parse the Content-Disposition header
+      QString contentDisposition = contentDispositionVariant.toString();
+      
+      // Use Qt's QUrlQuery to parse parameters more reliably
+      // First, convert the Content-Disposition format to a query-like format
+      QString queryString = contentDisposition;
+      queryString.replace("filename=", "filename=");
+      queryString.replace(";", "&");
+      
+      // Extract the filename parameter
+      QString filename;
+      int filenamePos = contentDisposition.indexOf("filename=");
+      
+      if (filenamePos >= 0) {
+         // Extract everything after "filename="
+         filename = contentDisposition.mid(filenamePos + 9);
+         
+         // Handle quoted filenames
+         if (filename.startsWith('"')) {
+            int endQuotePos = filename.indexOf('"', 1);
+            if (endQuotePos > 0) {
+               filename = filename.mid(1, endQuotePos - 1);
+            }
+         } else {
+            // For unquoted filenames, stop at the first semicolon or whitespace
+            int endPos = filename.indexOf(';');
+            if (endPos < 0) {
+               endPos = filename.indexOf(' ');
+            }
+            
+            if (endPos > 0) {
+               filename = filename.left(endPos);
+            }
+         }
+         
+         // Extract just the filename if it contains a path
+         QFileInfo fileInfo(filename);
+         filename = fileInfo.fileName();
+         
+         // Set the filename
+         setFileName(filename);
       }
-      setFileName(filename);
    }
 }
 
@@ -374,28 +456,24 @@ void Downloader::metaDataChanged()
  * Uses the \a received and \a total parameters to get the download progress
  * and update the progressbar value on the dialog.
  */
-void Downloader::updateProgress(qint64 received, qint64 total)
-{
-   if (total > 0)
-   {
-      m_ui->progressBar->setMinimum(0);
-      m_ui->progressBar->setMaximum(100);
-      m_ui->progressBar->setValue((received * 100) / total);
-
-      calculateSizes(received, total);
-      calculateTimeRemaining(received, total);
-      saveFile(received, total);
-   }
-
-   else
-   {
-      m_ui->progressBar->setMinimum(0);
-      m_ui->progressBar->setMaximum(0);
-      m_ui->progressBar->setValue(-1);
-      m_ui->downloadLabel->setText(tr("Downloading Updates") + "...");
-      m_ui->timeLabel->setText(QString("%1: %2").arg(tr("Time Remaining")).arg(tr("Unknown")));
-   }
-}
+ void Downloader::updateProgress(qint64 received, qint64 total)
+ {
+     if (total > 0) {
+         m_ui->progressBar->setMinimum(0);
+         m_ui->progressBar->setMaximum(100);
+         m_ui->progressBar->setValue((received * 100) / total);
+ 
+         calculateSizes(received, total);
+         calculateTimeRemaining(received, total);
+         // Removed call to saveFile()
+     } else {
+         m_ui->progressBar->setMinimum(0);
+         m_ui->progressBar->setMaximum(0);
+         m_ui->progressBar->setValue(-1);
+         m_ui->downloadLabel->setText(tr("Downloading Updates") + "...");
+         m_ui->timeLabel->setText(QString("%1: %2").arg(tr("Time Remaining")).arg(tr("Unknown")));
+     }
+ }
 
 /**
  * Uses two time samples (from the current time and a previous sample) to
